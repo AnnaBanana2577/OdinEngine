@@ -72,18 +72,18 @@ tick :: proc(ctx: ^net.Context, s: ^Game_State, inputs: ^[net.MAX_PLAYERS]Input)
 	for p, h in net.next(&it) {
 		o := net.owner(&s.players, h)
 		if o == net.NO_PLAYER do continue
-		in := inputs[o]
+		input := inputs[o]
 
-		move := [2]f32{f32(in.move.x), f32(in.move.y)}
+		move := [2]f32{f32(input.move.x), f32(input.move.y)}
 		if linalg.length(move) > 0 do move = linalg.normalize(move)
 		p.pos += move * SPEED * ctx.dt
 		p.pos.x = clamp(p.pos.x, PLAYER_SIZE / 2, ARENA.x - PLAYER_SIZE / 2)
 		p.pos.y = clamp(p.pos.y, PLAYER_SIZE / 2, ARENA.y - PLAYER_SIZE / 2)
-		p.aim = in.aim
+		p.aim = input.aim
 
 		if net.is_mine(ctx, &s.players, h) {
 			p.cooldown = max(p.cooldown - ctx.dt, 0)
-			if .Fire in in.buttons && p.cooldown == 0 do fire(ctx, s, o, h, p)
+			if .Fire in input.buttons && p.cooldown == 0 do fire(ctx, s, o, h, p)
 		}
 	}
 
@@ -197,8 +197,9 @@ ray_box :: proc(origin, dir, center: [2]f32, half: f32) -> (t: f32, hit: bool) {
 // Distance along the ray until it leaves the arena.
 ray_exit_arena :: proc(origin, dir: [2]f32) -> f32 {
 	t := f32(math.F32_MAX)
+	arena := ARENA
 	for axis in 0 ..< 2 {
-		if dir[axis] > 1e-6 do t = min(t, (ARENA[axis] - origin[axis]) / dir[axis])
+		if dir[axis] > 1e-6 do t = min(t, (arena[axis] - origin[axis]) / dir[axis])
 		if dir[axis] < -1e-6 do t = min(t, -origin[axis] / dir[axis])
 	}
 	return t
@@ -220,12 +221,12 @@ bot_input :: proc(b: ^Bot, dt: f32) -> Input {
 		b.wander = {i8(rand.int_max(3) - 1), i8(rand.int_max(3) - 1)}
 		b.firing = rand.float32() < 0.6
 	}
-	in := Input{move = b.wander}
+	input := Input{move = b.wander}
 
 	me := net.local_player(&b.cl)
-	if me == net.NO_PLAYER do return in
+	if me == net.NO_PLAYER do return input
 	mine, ok := net.get(&b.state.players, b.state.avatar[me])
-	if !ok do return in
+	if !ok do return input
 
 	best := f32(math.F32_MAX)
 	it := net.iter(&b.state.players)
@@ -234,9 +235,9 @@ bot_input :: proc(b: ^Bot, dt: f32) -> Input {
 		if d := linalg.distance(mine.pos, other.pos); d < best {
 			best = d
 			to := other.pos - mine.pos
-			in.aim = math.atan2(to.y, to.x) + rand.float32_range(-0.12, 0.12)
+			input.aim = math.atan2(to.y, to.x) + rand.float32_range(-0.12, 0.12)
 		}
 	}
-	if b.firing && best < 14 do in.buttons += {.Fire}
-	return in
+	if b.firing && best < 14 do input.buttons += {.Fire}
+	return input
 }

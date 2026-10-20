@@ -326,12 +326,12 @@ tick :: proc(ctx: ^net.Context, s: ^Game_State, inputs: ^[net.MAX_PLAYERS]Input)
     for p, h in net.next(&it) {
         o := net.owner(&s.players, h)
         if o == net.NO_PLAYER do continue          // inputs are only indexed by real players
-        in := inputs[o]
-        move_player(p, in, ctx.dt)                 // runs for everyone: local, remote, server
+        input := inputs[o]
+        move_player(p, input, ctx.dt)                 // runs for everyone: local, remote, server
 
         if net.is_mine(ctx, &s.players, h) {       // only the owner decides to shoot
             p.cooldown -= ctx.dt
-            if .Fire in in.buttons && p.cooldown <= 0 do fire(ctx, s, h, p)
+            if .Fire in input.buttons && p.cooldown <= 0 do fire(ctx, s, h, p)
         }
     }
 
@@ -501,4 +501,4 @@ Only `enet.odin` imports ENet. The loopback transport gives a listen server / si
 3. ✅ ENet transport, tested over localhost UDP.
 
 Run the tests with `odin test tests/net -collection:engine=engine`.
-4. Demo in `game/`: squares moving and shooting, with fake 150 ms lag and 5% loss.
+4. ✅ Demo in `game/`: squares moving and shooting (host / server / client / selftest), see readme.
