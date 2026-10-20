@@ -8,7 +8,7 @@ import net "engine:net"
 
 ENET_PORT :: 47913
 
-L_Server :: net.Server(L_State, L_Input, L_Event)
+L_Server :: net.Server(L_State, L_Input, L_Event, L_Message)
 
 // Steps everything once per simulated frame, sleeping 1ms so packets actually cross the socket.
 enet_step :: proc(srv: ^L_Server, peers: []L_Peer) {

@@ -29,6 +29,8 @@ field_capture :: proc(f: Field, p: rawptr) -> u64 {
 		if math.is_nan(turns) || math.is_inf(turns) do return 0
 		turns -= math.floor(turns)
 		return truncate(u64(math.round(turns * f64(u64(1) << f.bits))), f.bits)
+	case .String:
+		panic("net: strings are only sent in full (events, messages)")
 	}
 	return 0
 }
@@ -47,6 +49,8 @@ field_restore :: proc(f: Field, p: rawptr, v: u64) {
 	case .Angle:
 		// Angles come back in [0, TAU).
 		store_float(p, f.size, f64(v) / f64(u64(1) << f.bits) * math.TAU)
+	case .String:
+		panic("net: strings are only sent in full (events, messages)")
 	}
 }
 
@@ -65,20 +69,53 @@ field_read :: proc(r: ^Bit_Reader, f: Field) -> u64 {
 	return read_varint(r)
 }
 
+MAX_STRING_BYTES :: 4096
+
 // Writes the fields of the struct at `p` in full (no baseline). `filter` limits it to one authority.
 write_values :: proc(w: ^Bit_Writer, fields: []Field, p: rawptr, filter: Maybe(Authority) = nil) {
 	for f in fields {
 		if a, ok := filter.?; ok && f.authority != a do continue
-		field_write(w, f, field_capture(f, rawptr(uintptr(p) + f.offset)))
+		ptr := rawptr(uintptr(p) + f.offset)
+		if f.kind == .String {
+			write_string(w, (^string)(ptr)^)
+		} else {
+			field_write(w, f, field_capture(f, ptr))
+		}
 	}
 }
 
 // Reads what write_values wrote into the struct at `p`.
+// Strings are allocated with context.temp_allocator; copy them if you keep them.
 read_values :: proc(r: ^Bit_Reader, fields: []Field, p: rawptr, filter: Maybe(Authority) = nil) {
 	for f in fields {
 		if a, ok := filter.?; ok && f.authority != a do continue
-		field_restore(f, rawptr(uintptr(p) + f.offset), field_read(r, f))
+		ptr := rawptr(uintptr(p) + f.offset)
+		if f.kind == .String {
+			(^string)(ptr)^ = read_string(r)
+		} else {
+			field_restore(f, ptr, field_read(r, f))
+		}
 	}
+}
+
+// Length (varint) then bytes. Longer strings are cut at MAX_STRING_BYTES.
+@(private = "file")
+write_string :: proc(w: ^Bit_Writer, s: string) {
+	n := min(len(s), MAX_STRING_BYTES)
+	write_varint(w, u64(n))
+	for i in 0 ..< n do write_bits(w, u64(s[i]), 8)
+}
+
+@(private = "file")
+read_string :: proc(r: ^Bit_Reader) -> string {
+	n := read_varint(r)
+	if n > MAX_STRING_BYTES {
+		r.overflow = true
+		return ""
+	}
+	buf := make([]u8, n, context.temp_allocator)
+	for &c in buf do c = u8(read_bits(r, 8))
+	return "" if r.overflow else string(buf)
 }
 
 @(private = "file")

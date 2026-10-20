@@ -10,8 +10,9 @@ or the client that owns it. Every peer simulates everything, using the last know
 remote players. When data arrives from an entity's authority, it **overwrites** the local copy.
 The server sends each client a **delta-compressed snapshot**, relative to the last snapshot
 that client acknowledged. Clients send their **input + owned entity state** every tick
-(unreliable) and **gameplay events** (shots, hits, interactions) reliably. The server validates,
-applies, and relays.
+(unreliable). **Gameplay events** (shots, hits, kills) are tick-stamped and ride inside those same
+packets, so they line up with the state. **Messages** (chat, announcements) go reliably, untimed.
+The server validates, applies, and relays.
 
 This is client authority, not client-side prediction: no rollback, no replay, no reconciliation.
 
@@ -21,8 +22,9 @@ This is client authority, not client-side prediction: no rollback, no replay, no
   │ recv → overwrite     │        │ recv → overwrite A's     │        │                      │
   │   non-owned state    │──in+───▶   owned fields (validated)│        │                      │
   │ tick(state, inputs)  │  state │ tick(state, inputs)      │        │                      │
-  │ emit Hit{B} ─────────┼─reliable▶ on_event: validate, dmg │        │                      │
-  │                      │◀─snap──│ encode Δ per client      │──snap──▶ overwrite, extrapolate│
+  │ emit Hit{B} (in the  │        │ on_event: validate, dmg  │        │                      │
+  │   next update)       │◀─snap──│ encode Δ + events        │──snap──▶ apply, fire events,  │
+  │                      │        │                          │        │   extrapolate        │
   └──────────────────────┘        └──────────────────────────┘        └──────────────────────┘
 ```
 
@@ -68,28 +70,32 @@ Input :: struct {
     aim:     f32                  `net:"angle,bits=12"`,
 }
 
-Event :: union { Shot, Hit, Interact, Chat, Kill }
+Event   :: union { Shot, Hit, Interact, Kill }        // gameplay, tick-aligned
+Message :: union { Chat, Round_Start, Round_End }     // meta, reliable, untimed
 ```
 
 ```odin
-Game :: struct($S, $I, $V: typeid) {
+Game :: struct($S, $I, $V, $M: typeid) {
     // Advances the whole game one tick. Same proc on server and clients.
     // inputs[p] = live input for the local player, last known input for everyone else.
-    tick:     proc(ctx: ^net.Context, s: ^S, inputs: ^[net.MAX_PLAYERS]I),
+    tick:       proc(ctx: ^net.Context, s: ^S, inputs: ^[net.MAX_PLAYERS]I),
 
-    // Server: event from a client. Validate it, then apply or reject.
-    // Client: event relayed or sent by the server. Play effects.
-    on_event: proc(ctx: ^net.Context, s: ^S, from: net.Player_Id, ev: V),
+    // Server: event from a client, right after that client's state for the same tick. Validate it.
+    // Client: event from the server, right after the snapshot carrying it is applied. Play effects.
+    on_event:   proc(ctx: ^net.Context, s: ^S, from: net.Player_Id, ev: V),
+
+    // Server: message from a client. Client: message from the server (`from` is NO_PLAYER).
+    on_message: proc(ctx: ^net.Context, s: ^S, from: net.Player_Id, msg: M),
 
     // Server only: a player connected / disconnected. Spawn or remove their entity here.
-    on_join:  proc(ctx: ^net.Context, s: ^S, p: net.Player_Id),
-    on_leave: proc(ctx: ^net.Context, s: ^S, p: net.Player_Id),
+    on_join:    proc(ctx: ^net.Context, s: ^S, p: net.Player_Id),
+    on_leave:   proc(ctx: ^net.Context, s: ^S, p: net.Player_Id),
 }
 ```
 
 See section 11 for a full example.
 
-The game makes an alias once: `Net_Client :: net.Client(Game_State, Input, Event)`.
+The game makes an alias once: `Net_Client :: net.Client(Game_State, Input, Event, Message)`.
 
 Inside `tick`, the game gates consequences with `ctx.is_server` (damage, spawns, score) and
 can check `net.has_authority(ctx, pool, handle)` when needed. Moving a remote entity is always
@@ -161,10 +167,12 @@ Schema  :: struct { sections: []Section, hash: u64 }
 | *(no tag)*           | not replicated                               |
 
 Supported: ints, floats, bool, enums, `bit_set`, fixed arrays (each element is a leaf), nested
-structs (flattened), `net.Pool`. Unions are only used for events (a tag byte, then the variant's fields).
-Slices, maps, pointers, strings, and dynamic arrays inside tagged fields are a schema-build error.
+structs (flattened), `net.Pool`. Unions are only used for events and messages (variant index,
+then the variant's fields). `string` is allowed in event and message variants only, since those are
+sent in full rather than diffed. Received strings live in `context.temp_allocator`, so copy any you keep.
+Slices, maps, pointers, and dynamic arrays inside tagged fields are a schema-build error.
 The schema hash is checked in the connect handshake, so mismatched builds cannot connect.
-The same builder handles `Input` and each `Event` variant.
+The same builder handles `Input` and each `Event` and `Message` variant.
 
 ## 6. Snapshots & delta compression
 
@@ -210,15 +218,48 @@ Every packet starts with an 8-bit `Message_Kind` (see `protocol.odin`).
 
 | message | dir | channel | contents |
 |---|---|---|---|
-| Hello | C→S | reliable | protocol hash (state + input + event layouts). Mismatch → kicked |
+| Hello | C→S | reliable | protocol hash (state + input + event + message layouts). Mismatch → kicked |
 | Welcome | S→C | reliable | player id, tick rate, server tick |
-| Client_Update | C→S | unreliable | client tick, acked snapshot tick, input, owned entities (owner fields only) |
-| Snapshot | S→C | unreliable | server tick, baseline tick, echoed client tick, Δsnapshot |
-| Event | both | reliable | tick, sender (`NO_PLAYER` when the server sent it), event |
+| Client_Update | C→S | unreliable | client tick, acked snapshot tick, input, owned entities (owner fields only), events |
+| Snapshot | S→C | unreliable | server tick, baseline tick, echoed client tick, Δsnapshot, events |
+| Message | both | reliable | message |
 
 Owned entities go in full (quantized) every tick. They are small, and this avoids a second ack system.
 Each owned entity carries its `gen` and `override`. The server ignores it if either is stale.
-Event variants are structs whose fields need `net` tags like everything else, and they are sent in full.
+
+### Events vs messages
+
+| | **Events** (`emit`) | **Messages** (`send`) |
+|---|---|---|
+| For | gameplay: Shot, Hit, Kill, Explosion | meta: Chat, Round_Start, Round_End, notices |
+| Rides in | Snapshot / Client_Update (unreliable) | its own reliable, ordered packet |
+| Timing | tick-stamped; fired right after the matching state | whenever it arrives |
+| Delivery | resent until acked or TTL expires; receiver drops duplicates | guaranteed |
+| Sent from | game callbacks (or a ^Client between ticks) | anywhere: `ctx`, `^Client`, `^Server` |
+
+**How events survive loss.** Each sender keeps an event log. Every packet repeats the events the
+other side hasn't confirmed:
+- server → client: events with tick > the client's acked snapshot tick
+- client → server: events with tick > the client tick the server last echoed
+
+An event is stamped with the tick of the **first packet that carries it**: the current tick inside a
+tick, or the next tick when emitted between ticks. That way "acked up to tick N" really means
+"has everything stamped ≤ N". Each event has an increasing id, and receivers skip ids they've seen.
+
+**TTL.** `Config.event_ttl` (default 1 s) is how long an event is resent. Per emit,
+`ttl = 0.25` overrides it, `ttl = 0` means "only in the next packet", and `ttl = net.FOREVER`
+resends it until acked. A cosmetic muzzle flash that's 2 s late is worse than none, while a kill
+should always arrive.
+
+**Order on the client.** Snapshot received → events queued → next tick: apply the snapshot, then
+fire its events, then run `tick`. If several snapshots arrive between ticks, only the newest state
+is applied, but every event from all of them fires, in order.
+
+**Order on the server.** For each Client_Update: input, then owned entities, then events. A
+client's `Hit` is validated against that client's position from the same tick.
+
+Prefer **state** for anything a late joiner needs. For example, `round_phase` and `round_timer`
+are tagged fields, and Round_Start / Round_End messages are just the announcement.
 
 ## 8. Tick loops
 
@@ -229,18 +270,21 @@ Both loops have the same shape: **receive → apply authoritative data → tick 
 1. Receive. For each client packet that is newer than the last one from that client: store its input.
    If its `override` matches, copy its owner fields into its entities, after the pool's `server_validate` check
    (max speed, inside the map).
-2. Reliable client events → `on_event`.
-3. `tick(ctx, s, inputs)`. Players with no new packet keep their last input, so the server extrapolates them too.
-4. Capture snapshot → ring. For each client: encode Δ against its ack, send.
-5. Flush outgoing events.
+   Then the update's new events → `on_event`. Reliable messages → `on_message`.
+2. `tick(ctx, s, inputs)`. Players with no new packet keep their last input, so the server extrapolates them too.
+3. Capture snapshot → ring. For each client: encode Δ against its ack, append its unacked events, send.
+4. Drop events that expired or that every recipient acked.
+5. After all ticks of the update: send queued messages.
 
 **Client**
-1. Receive. If the newest snapshot is newer than the last applied one: decode it and write it into
-   `Game_State`. Non-owned entities get all fields. Owned entities get only server fields, or all fields on `override`.
+1. Receive. Decode newer snapshots into the ring, queue their new events, and drop own events the
+   server echoed. Messages → `on_message` immediately.
+2. Tick. If a newer snapshot was received: write it into `Game_State`, then fire its queued events.
+   Non-owned entities get all fields. Owned entities get only server fields, or all fields on `override`.
    Spawned or removed slots are applied. Remote inputs are updated.
-2. `inputs[local] = sample_input()`.
-3. `tick(ctx, s, inputs)`. Remote entities extrapolate from the snapshot state with their last input.
-4. Send input + owned fields + ack. Send queued events.
+3. `inputs[local] = sample_input()`, then `tick(ctx, s, inputs)`. Remote entities extrapolate from
+   the snapshot state with their last input.
+4. Send input + owned fields + ack + unacked events. After all ticks: send queued messages.
 
 There is no clock sync. Ticks only order packets and measure RTT. Nothing rewinds, so the
 client and server ticks don't need to line up.
@@ -266,16 +310,21 @@ Context :: struct {
     dt:           f32,
     is_server:    bool,
     local_player: Player_Id,  // NO_PLAYER on the server
-    // internal: event queue + event schema
+    // internal: event log, message queue, schemas
 }
 
-net.emit(ctx, ev)                 // client → server; server → all. `ev` is the union or one variant
-net.emit_to(ctx, player, ev)      // server only
-net.emit_except(ctx, player, ev)  // server only (relay)
+// Events: `ev` is the Event union or one variant. `ttl` is optional (seconds, 0, or net.FOREVER).
+net.emit(ctx, ev, ttl = ...)              // client → server; server → all
+net.emit_to(ctx, player, ev, ttl = ...)   // server only
+net.emit_except(ctx, player, ev)          // server only (relay)
+
+// Messages: the first argument can be a ctx, a ^Client or a ^Server.
+net.send(ctx | &cl | &srv, msg)           // client → server; server → all
+net.send_to(ctx | &srv, player, msg)      // server only
+net.send_except(ctx | &srv, player, msg)  // server only
 ```
 
-Events are queued and sent at the end of the tick. The sender's own `on_event` is not called;
-play local effects directly.
+The sender's own `on_event` / `on_message` is not called, so play local effects directly.
 
 ## 11. Game API (full example)
 
@@ -308,17 +357,18 @@ Player :: struct {
 Shot :: struct { origin: [2]f32 `net:"q=0.01"`, dir: f32 `net:"angle,bits=12"` }
 Hit  :: struct { target: net.Handle `net:""` }
 Kill :: struct { killer, victim: net.Player_Id `net:""` }
-Event :: union { Shot, Hit, Kill }
+Event   :: union { Shot, Hit, Kill }
+Message :: union { Chat }                    // Chat :: struct { from: net.Player_Id `net:""`, text: string `net:""` }
 
-Net_Server :: net.Server(Game_State, Input, Event)
-Net_Client :: net.Client(Game_State, Input, Event)
+Net_Server :: net.Server(Game_State, Input, Event, Message)
+Net_Client :: net.Client(Game_State, Input, Event, Message)
 ```
 
 ### Hooks
 
 ```odin
-make_game :: proc() -> net.Game(Game_State, Input, Event) {
-    return {tick = tick, on_event = on_event, on_join = on_join, on_leave = on_leave}
+make_game :: proc() -> net.Game(Game_State, Input, Event, Message) {
+    return {tick = tick, on_event = on_event, on_message = on_message, on_join = on_join, on_leave = on_leave}
 }
 
 tick :: proc(ctx: ^net.Context, s: ^Game_State, inputs: ^[net.MAX_PLAYERS]Input) {
@@ -367,12 +417,23 @@ on_event :: proc(ctx: ^net.Context, s: ^Game_State, from: net.Player_Id, ev: Eve
         if target.health == 0 {
             s.scores[from] += 1
             respawn(ctx, s, e.target)
-            net.emit(ctx, Kill{from, net.owner(&s.players, e.target)})
+            net.emit(ctx, Kill{from, net.owner(&s.players, e.target)}, ttl = net.FOREVER)
         }
     case Kill:
         show_killfeed(e)
     }
 }
+
+on_message :: proc(ctx: ^net.Context, s: ^Game_State, from: net.Player_Id, msg: Message) {
+    switch m in msg {
+    case Chat:
+        if ctx.is_server do net.send(ctx, Chat{from = from, text = m.text})  // stamp the real sender, relay
+        else do add_chat_line(s, m.from, m.text)                            // m.text is temp memory: copy it
+    }
+}
+
+// From UI code, outside any callback:
+//     net.send(&cl, Chat{text = input_box_text})
 
 on_join :: proc(ctx: ^net.Context, s: ^Game_State, p: net.Player_Id) {
     s.player_entity[p] = net.spawn(ctx, &s.players, Player{pos = spawn_point(s), health = 100}, owner = p)
@@ -454,12 +515,13 @@ run_host :: proc() {
 
 | Area | API |
 |---|---|
-| Setup | `Game{tick, on_event, on_join, on_leave}`, `Config{tick_rate, snapshot_every, max_catchup}` |
+| Setup | `Game{tick, on_event, on_message, on_join, on_leave}`, `Config{tick_rate, snapshot_every, max_catchup, event_ttl}` |
 | Server | `server_start`, `server_update`, `server_stop`, `server_validate(pool, proc)`, `kick` |
 | Client | `client_start`, `client_update(dt, input)`, `client_stop`, `status`, `local_player`, `ping`, `alpha`, `player_connected` |
 | Transport | `enet_host(port, bind_address)`, `enet_connect(address, port)`, `loopback_init/_server/_client/_destroy` |
 | Pools | `spawn`, `despawn`, `get`, `iter`/`next`, `owner`, `is_mine`, `has_authority`, `force_sync` |
-| Events | `emit`, `emit_to`, `emit_except` |
+| Events | `emit`, `emit_to`, `emit_except` (optional `ttl`, `FOREVER`) |
+| Messages | `send`, `send_to`, `send_except` (ctx, ^Client or ^Server) |
 | Context | `ctx.tick`, `ctx.dt`, `ctx.is_server`, `ctx.local_player` |
 
 ## 12. Package layout
@@ -473,8 +535,8 @@ engine/net/
   snapshot.odin    capture/apply snapshot ↔ state, ring buffer
   delta.odin       encode/decode snapshot against a baseline
   pool.odin        Pool, Handle, get/iter/next/owner
-  events.odin      Event union schema, encode/decode, event queue
-  context.odin     Game, Config, Context, emit*, spawn/despawn/force_sync
+  events.odin      union schemas (events + messages), event log + wire format, message queue
+  context.odin     Game, Config, Context, emit*, send*, spawn/despawn/force_sync
   protocol.odin    message kinds, owned-entity encoding, Player_Table, Core (shared by server and client)
   transport.odin   Transport interface
   loopback.odin    in-process Transport with fake lag/jitter/loss

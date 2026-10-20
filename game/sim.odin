@@ -54,13 +54,17 @@ Shot :: struct {
 }
 Hit  :: struct { target: net.Handle `net:""` }
 Kill :: struct { killer, victim: net.Player_Id `net:""` }
-Event :: union { Shot, Hit, Kill }
+Event :: union { Shot, Hit, Kill } // gameplay: ride in snapshots, line up with state
 
-Net_Server :: net.Server(Game_State, Input, Event)
-Net_Client :: net.Client(Game_State, Input, Event)
+// Messages: reliable, any time, not tied to ticks.
+Announce :: struct { text: string `net:""` }
+Message :: union { Announce }
 
-make_game :: proc() -> net.Game(Game_State, Input, Event) {
-	return {tick = tick, on_event = on_event, on_join = on_join, on_leave = on_leave}
+Net_Server :: net.Server(Game_State, Input, Event, Message)
+Net_Client :: net.Client(Game_State, Input, Event, Message)
+
+make_game :: proc() -> net.Game(Game_State, Input, Event, Message) {
+	return {tick = tick, on_event = on_event, on_message = on_message, on_join = on_join, on_leave = on_leave}
 }
 
 game_state_destroy :: proc(s: ^Game_State) {
@@ -139,23 +143,30 @@ on_event :: proc(ctx: ^net.Context, s: ^Game_State, from: net.Player_Id, ev: Eve
 		victim := net.owner(&s.players, e.target)
 		s.scores[from] += 1
 		respawn(ctx, s, e.target)
-		net.emit(ctx, Kill{from, victim})
+		net.emit(ctx, Kill{from, victim}, ttl = net.FOREVER) // a kill must arrive, however late
 
 	case Kill:
 		fmt.printfln("player %d fragged player %d", e.killer, e.victim)
 	}
 }
 
+on_message :: proc(ctx: ^net.Context, s: ^Game_State, from: net.Player_Id, msg: Message) {
+	switch m in msg {
+	case Announce:
+		if !ctx.is_server do fmt.println(m.text)
+	}
+}
+
 on_join :: proc(ctx: ^net.Context, s: ^Game_State, p: net.Player_Id) {
 	s.avatar[p] = net.spawn(ctx, &s.players, Player{pos = spawn_point(), hp = MAX_HP}, owner = p)
-	fmt.printfln("player %d joined", p)
+	net.send(ctx, Announce{fmt.tprintf("player %d joined", p)})
 }
 
 on_leave :: proc(ctx: ^net.Context, s: ^Game_State, p: net.Player_Id) {
 	net.despawn(ctx, &s.players, s.avatar[p])
 	s.avatar[p] = {}
 	s.scores[p] = 0
-	fmt.printfln("player %d left", p)
+	net.send(ctx, Announce{fmt.tprintf("player %d left", p)})
 }
 
 respawn :: proc(ctx: ^net.Context, s: ^Game_State, h: net.Handle) {

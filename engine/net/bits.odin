@@ -104,6 +104,31 @@ read_varint :: proc(r: ^Bit_Reader) -> u64 {
 	return 0
 }
 
+// Copies `count` bits from a buffer filled by a Bit_Writer (e.g. a pre-encoded event).
+write_bits_from :: proc(w: ^Bit_Writer, src: []u8, count: int) {
+	r := reader_init(src)
+	for n := count; n > 0; n -= 32 {
+		k := min(n, 32)
+		write_bits(w, read_bits(&r, k), k)
+	}
+}
+
+// Reads the next `count` bits into a new byte slice.
+read_bits_to_slice :: proc(r: ^Bit_Reader, count: int, allocator := context.allocator) -> []u8 {
+	out := make([]u8, (count + 7) / 8, allocator)
+	w := writer_init(out)
+	for n := count; n > 0; n -= 32 {
+		k := min(n, 32)
+		write_bits(&w, read_bits(r, k), k)
+	}
+	return out
+}
+
+// Bits left to read.
+reader_remaining :: proc(r: ^Bit_Reader) -> int {
+	return max(len(r.buf) * 8 - r.bit_pos, 0)
+}
+
 // Maps signed to unsigned so small negative numbers stay small: 0, -1, 1, -2 -> 0, 1, 2, 3.
 zigzag_encode :: #force_inline proc "contextless" (v: i64) -> u64 {
 	return u64((v << 1) ~ (v >> 63))

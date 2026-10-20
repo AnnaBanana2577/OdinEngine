@@ -3,8 +3,8 @@ package net
 import "core:log"
 import "core:mem"
 
-Server :: struct($S, $I, $V: typeid) {
-	using core: Core(S, I, V),
+Server :: struct($S, $I, $V, $M: typeid) {
+	using core: Core(S, I, V, M),
 	clients:    [MAX_PLAYERS]Connection, // index = player id
 	validators: []Validator,             // per schema section
 	scratch:    []u8,                    // one pool item, for validating client updates
@@ -13,8 +13,10 @@ Server :: struct($S, $I, $V: typeid) {
 Connection :: struct {
 	state:       Connection_State,
 	peer:        Peer_Id,
-	ack:         Tick, // newest snapshot the client has; the baseline for the next one
+	joined_tick: Tick, // events from before this tick are not sent to this client
+	ack:         Tick, // newest snapshot the client has: the delta baseline, and what events it has
 	client_tick: Tick, // newest client update received; older ones are dropped
+	last_event:  u32,  // newest event id received from this client
 }
 
 Connection_State :: enum u8 {
@@ -26,7 +28,7 @@ Connection_State :: enum u8 {
 Validator :: #type proc(ctx: ^Context, from: Player_Id, old, new: rawptr) -> bool
 
 // `state` must stay at the same address until server_stop.
-server_start :: proc(srv: ^Server($S, $I, $V), state: ^S, game: Game(S, I, V), transport: Transport, config := DEFAULT_CONFIG) -> (err: string) {
+server_start :: proc(srv: ^Server($S, $I, $V, $M), state: ^S, game: Game(S, I, V, M), transport: Transport, config := DEFAULT_CONFIG) -> (err: string) {
 	if err = core_init(&srv.core, state, game, transport, config, is_server = true); err != "" do return
 	srv.validators = make([]Validator, len(srv.schema.sections))
 	stride := 0
@@ -35,7 +37,7 @@ server_start :: proc(srv: ^Server($S, $I, $V), state: ^S, game: Game(S, I, V), t
 	return ""
 }
 
-server_stop :: proc(srv: ^Server($S, $I, $V)) {
+server_stop :: proc(srv: ^Server($S, $I, $V, $M)) {
 	for c in srv.clients {
 		if c.state != .Free do transport_disconnect(srv.transport, c.peer)
 	}
@@ -47,7 +49,7 @@ server_stop :: proc(srv: ^Server($S, $I, $V)) {
 
 // Registers a check for owner-written fields that clients send for entities in `pool`.
 // `old` is the server's current entity, `new` is what the client claims. Return false to reject.
-server_validate :: proc(srv: ^Server($S, $I, $V), pool: ^Pool($T, $N), fn: proc(ctx: ^Context, from: Player_Id, old, new: ^T) -> bool) {
+server_validate :: proc(srv: ^Server($S, $I, $V, $M), pool: ^Pool($T, $N), fn: proc(ctx: ^Context, from: Player_Id, old, new: ^T) -> bool) {
 	offset := uintptr(&pool.items) - uintptr(srv.state)
 	for sec, i in srv.schema.sections {
 		if sec.root == 0 && sec.is_pool && sec.items == offset {
@@ -58,22 +60,32 @@ server_validate :: proc(srv: ^Server($S, $I, $V), pool: ^Pool($T, $N), fn: proc(
 	panic("net.server_validate: pool is not a replicated part of the server's state")
 }
 
-server_update :: proc(srv: ^Server($S, $I, $V), dt: f32) {
+server_update :: proc(srv: ^Server($S, $I, $V, $M), dt: f32) {
 	transport_update(srv.transport, dt)
 	for _ in 0 ..< ticks_due(&srv.core, dt) do server_tick(srv)
+
+	for m in srv.messages.items {
+		for c, p in srv.clients {
+			if c.state == .Joined && is_for(m.target, m.player, Player_Id(p)) {
+				transport_send(srv.transport, c.peer, .Reliable, srv.messages.bytes[m.start:m.end])
+			}
+		}
+	}
+	message_queue_clear(&srv.messages)
 	transport_flush(srv.transport)
 }
 
 // Disconnects a player. on_leave runs right away.
-kick :: proc(srv: ^Server($S, $I, $V), p: Player_Id) {
+kick :: proc(srv: ^Server($S, $I, $V, $M), p: Player_Id) {
 	if int(p) >= MAX_PLAYERS || srv.clients[p].state == .Free do return
 	transport_disconnect(srv.transport, srv.clients[p].peer)
 	drop_client(srv, p)
 }
 
 @(private)
-server_tick :: proc(srv: ^Server($S, $I, $V)) {
-	srv.ctx.tick += 1
+server_tick :: proc(srv: ^Server($S, $I, $V, $M)) {
+	event_tick_begin(&srv.ctx)
+	defer event_tick_end(&srv.ctx)
 	server_receive(srv)
 	srv.game.tick(&srv.ctx, srv.state, &srv.table.slots.items)
 
@@ -85,18 +97,29 @@ server_tick :: proc(srv: ^Server($S, $I, $V)) {
 		}
 	}
 
-	for e in srv.queue.items {
-		for c, p in srv.clients {
-			if c.state == .Joined && event_is_for(e, Player_Id(p)) {
-				transport_send(srv.transport, c.peer, .Reliable, srv.queue.bytes[e.start:e.end])
-			}
-		}
+	// Forget events that expired or that every client they are for has acked.
+	#reverse for e, i in srv.event_log.items {
+		if srv.ctx.tick <= e.expire && event_still_needed(srv, e) do continue
+		event_log_remove(&srv.event_log, i)
 	}
-	event_queue_clear(&srv.queue)
 }
 
 @(private)
-server_receive :: proc(srv: ^Server($S, $I, $V)) {
+event_still_needed :: proc(srv: ^Server($S, $I, $V, $M), e: Logged_Event) -> bool {
+	for c, p in srv.clients {
+		if c.state == .Joined && wants_event(c, Player_Id(p), e) do return true
+	}
+	return false
+}
+
+// Whether `e` still has to go out to this client.
+@(private)
+wants_event :: proc(c: Connection, p: Player_Id, e: Logged_Event) -> bool {
+	return e.tick > c.ack && e.tick >= c.joined_tick && is_for(e.target, e.player, p)
+}
+
+@(private)
+server_receive :: proc(srv: ^Server($S, $I, $V, $M)) {
 	for {
 		te, ok := transport_poll(srv.transport)
 		if !ok do break
@@ -117,7 +140,7 @@ server_receive :: proc(srv: ^Server($S, $I, $V)) {
 }
 
 @(private)
-server_handle_packet :: proc(srv: ^Server($S, $I, $V), p: Player_Id, data: []u8) {
+server_handle_packet :: proc(srv: ^Server($S, $I, $V, $M), p: Player_Id, data: []u8) {
 	c := &srv.clients[p]
 	r := reader_init(data)
 	kind, ok := read_message_header(&r)
@@ -127,7 +150,7 @@ server_handle_packet :: proc(srv: ^Server($S, $I, $V), p: Player_Id, data: []u8)
 	case .Hello:
 		hash := read_bits(&r, 64)
 		if c.state != .Pending do return
-		if r.overflow || hash != protocol_hash(&srv.schema, &srv.events) {
+		if r.overflow || hash != protocol_hash(&srv.core) {
 			log.warnf("net: player %d has a different game build, disconnecting", p)
 			kick(srv, p)
 			return
@@ -137,17 +160,17 @@ server_handle_packet :: proc(srv: ^Server($S, $I, $V), p: Player_Id, data: []u8)
 	case .Client_Update:
 		if c.state == .Joined do read_client_update(srv, p, &r)
 
-	case .Event:
-		if c.state != .Joined || srv.game.on_event == nil do return
-		read_bits(&r, 32 + 8) // tick and sender; the server already knows the sender
-		ev: V
-		if event_decode(&r, &srv.events, &ev) do srv.game.on_event(&srv.ctx, srv.state, p, ev)
+	case .Message:
+		if c.state != .Joined || srv.game.on_message == nil do return
+		msg: M
+		if union_decode(&r, &srv.message_schema, &msg) do srv.game.on_message(&srv.ctx, srv.state, p, msg)
 	}
 }
 
 @(private)
-join_client :: proc(srv: ^Server($S, $I, $V), p: Player_Id) {
+join_client :: proc(srv: ^Server($S, $I, $V, $M), p: Player_Id) {
 	srv.clients[p].state = .Joined
+	srv.clients[p].joined_tick = srv.ctx.tick
 	m := &srv.table.slots.meta[p]
 	gen := m.gen + 1
 	if gen == 0 do gen = 1
@@ -165,7 +188,7 @@ join_client :: proc(srv: ^Server($S, $I, $V), p: Player_Id) {
 }
 
 @(private)
-drop_client :: proc(srv: ^Server($S, $I, $V), p: Player_Id) {
+drop_client :: proc(srv: ^Server($S, $I, $V, $M), p: Player_Id) {
 	if srv.clients[p].state == .Joined {
 		if srv.game.on_leave != nil do srv.game.on_leave(&srv.ctx, srv.state, p)
 		srv.table.slots.meta[p].alive = false
@@ -174,8 +197,9 @@ drop_client :: proc(srv: ^Server($S, $I, $V), p: Player_Id) {
 	srv.clients[p] = {}
 }
 
+// Input, then owned entities, then events, so a client's events see its state from the same tick.
 @(private)
-read_client_update :: proc(srv: ^Server($S, $I, $V), p: Player_Id, r: ^Bit_Reader) {
+read_client_update :: proc(srv: ^Server($S, $I, $V, $M), p: Player_Id, r: ^Bit_Reader) {
 	c := &srv.clients[p]
 	client_tick := Tick(read_bits(r, 32))
 	ack := Tick(read_bits(r, 32))
@@ -208,10 +232,25 @@ read_client_update :: proc(srv: ^Server($S, $I, $V), p: Player_Id, r: ^Bit_Reade
 			mem.copy(item, claimed, sec.stride)
 		}
 	}
+
+	prev: u32
+	for read_bool(r) {
+		id, _, bits, ok := read_event_header(r, client_tick, &prev)
+		if !ok do return
+		end := r.bit_pos + bits
+		if id > c.last_event {
+			c.last_event = id
+			ev: V
+			if union_decode(r, &srv.event_schema, &ev) && srv.game.on_event != nil {
+				srv.game.on_event(&srv.ctx, srv.state, p, ev)
+			}
+		}
+		r.bit_pos = end
+	}
 }
 
 @(private)
-send_snapshot :: proc(srv: ^Server($S, $I, $V), c: ^Connection, p: Player_Id, snap: ^Snapshot) {
+send_snapshot :: proc(srv: ^Server($S, $I, $V, $M), c: ^Connection, p: Player_Id, snap: ^Snapshot) {
 	base: ^Snapshot
 	if c.ack != 0 do base = ring_get(&srv.ring, c.ack)
 
@@ -221,6 +260,13 @@ send_snapshot :: proc(srv: ^Server($S, $I, $V), c: ^Connection, p: Player_Id, sn
 	write_bits(&w, u64(base.tick) if base != nil else 0, 32)
 	write_bits(&w, u64(c.client_tick), 32)
 	delta_encode(&w, &srv.schema, base, snap)
+
+	prev: u32
+	for &e in srv.event_log.items {
+		if srv.ctx.tick <= e.expire && wants_event(c^, p, e) do write_event(&w, &e, snap.tick, &prev)
+	}
+	write_bool(&w, false)
+
 	if w.overflow {
 		log.errorf("net: snapshot for player %d is larger than %d bytes, not sent", p, MAX_PACKET)
 		return
@@ -229,7 +275,7 @@ send_snapshot :: proc(srv: ^Server($S, $I, $V), c: ^Connection, p: Player_Id, sn
 }
 
 @(private)
-find_peer :: proc(srv: ^Server($S, $I, $V), peer: Peer_Id) -> (Player_Id, bool) {
+find_peer :: proc(srv: ^Server($S, $I, $V, $M), peer: Peer_Id) -> (Player_Id, bool) {
 	for c, p in srv.clients {
 		if c.state != .Free && c.peer == peer do return Player_Id(p), true
 	}
@@ -237,7 +283,7 @@ find_peer :: proc(srv: ^Server($S, $I, $V), peer: Peer_Id) -> (Player_Id, bool) 
 }
 
 @(private)
-find_free :: proc(srv: ^Server($S, $I, $V)) -> (Player_Id, bool) {
+find_free :: proc(srv: ^Server($S, $I, $V, $M)) -> (Player_Id, bool) {
 	for c, p in srv.clients {
 		if c.state == .Free do return Player_Id(p), true
 	}

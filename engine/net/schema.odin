@@ -13,6 +13,7 @@ Field_Kind :: enum u8 {
 	Float_Raw,
 	Float_Quant,
 	Angle,
+	String, // events and messages only
 }
 
 Authority :: enum u8 {
@@ -64,6 +65,12 @@ build_schema :: proc(T: typeid, allocator := context.allocator) -> (schema: Sche
 // The engine uses this to replicate its player table next to the game state.
 // On failure the whole schema is destroyed.
 schema_append :: proc(schema: ^Schema, T: typeid, allocator := context.allocator) -> (err: string) {
+	return schema_append_ex(schema, T, allocator, allow_strings = false)
+}
+
+// Strings are allowed in events and messages, which are sent in full, but not in snapshots.
+@(private)
+schema_append_ex :: proc(schema: ^Schema, T: typeid, allocator: runtime.Allocator, allow_strings: bool) -> (err: string) {
 	ti, ok := runtime.type_info_base(type_info_of(T)).variant.(runtime.Type_Info_Struct)
 	if !ok {
 		schema_destroy(schema, allocator)
@@ -71,9 +78,10 @@ schema_append :: proc(schema: ^Schema, T: typeid, allocator := context.allocator
 	}
 
 	b := Builder {
-		schema    = schema,
-		root      = schema.roots,
-		allocator = allocator,
+		schema        = schema,
+		root          = schema.roots,
+		allocator     = allocator,
+		allow_strings = allow_strings,
 	}
 	schema.roots += 1
 	globals := make([dynamic]Field, allocator)
@@ -115,10 +123,11 @@ schema_destroy :: proc(s: ^Schema, allocator := context.allocator) {
 
 @(private = "file")
 Builder :: struct {
-	schema:    ^Schema,
-	root:      int,
-	err:       string,
-	allocator: runtime.Allocator,
+	schema:        ^Schema,
+	root:          int,
+	err:           string,
+	allocator:     runtime.Allocator,
+	allow_strings: bool,
 }
 
 @(private = "file")
@@ -232,6 +241,19 @@ walk_value :: proc(b: ^Builder, ti: ^runtime.Type_Info, offset: uintptr, path: s
 			field.kind = .Float_Raw
 			field.bits = u8(base.size * 8)
 		}
+		append(out, field)
+
+	case runtime.Type_Info_String:
+		if !b.allow_strings {
+			fail(b, path, "strings can only be used in events and messages, not in replicated state")
+			return
+		}
+		if v.is_cstring || v.encoding != .UTF_8 {
+			fail(b, path, "only `string` is supported")
+			return
+		}
+		if !check_int_opts(b, path, opts, 0) do return
+		field.kind = .String
 		append(out, field)
 
 	case:

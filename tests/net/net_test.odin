@@ -348,3 +348,27 @@ decode_garbage_does_not_crash :: proc(t: ^testing.T) {
 		net.delta_decode(&r, &schema, nil, &out)
 	}
 }
+
+Bad_String_State :: struct { name: string `net:""` }
+
+@(test)
+strings_only_in_unions :: proc(t: ^testing.T) {
+	schema, err := net.build_schema(Bad_String_State)
+	testing.expect(t, err != "", "strings must be rejected in replicated state")
+	net.schema_destroy(&schema)
+
+	Named :: struct { id: u8 `net:""`, name: string `net:""` }
+	Msg :: union { Named }
+	us, union_err := net.build_union_schema(Msg)
+	defer net.union_schema_destroy(&us)
+	testing.expect(t, union_err == "", union_err)
+
+	buf: [256]u8
+	w := net.writer_init(buf[:])
+	net.union_encode(&w, &us, Named, &Named{id = 7, name = "Ödin ✓"})
+	r := net.reader_init(net.writer_bytes(&w))
+	out: Msg
+	testing.expect(t, net.union_decode(&r, &us, &out))
+	got, ok := out.(Named)
+	testing.expect(t, ok && got.id == 7 && got.name == "Ödin ✓")
+}
